@@ -52,5 +52,8 @@ public class DeviceEvent {
     /** 卡货货道 */
     private String jamChannelCode;
 
+    /** 柜端已确认的指令序号（COMMAND_PULL/COMMAND_ACK 使用） */
+    private Long ackSeq;
+
     private LocalDateTime eventTime;
 }

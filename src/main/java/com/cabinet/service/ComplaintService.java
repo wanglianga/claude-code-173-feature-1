@@ -134,6 +134,10 @@ public class ComplaintService {
                             .orElse(null);
                     if (stock != null) {
                         stock.setQtyOnHand(stock.getQtyOnHand() + refundQty);
+                        // 批次已被临期停售/下架时，收回商品进隔离量，不会重新变成可售
+                        if (stock.getBatch().isSaleBlocked()) {
+                            stock.setQtyQuarantined(stock.getQtyQuarantined() + refundQty);
+                        }
                         stockRepository.save(stock);
                     }
                     ledgerService.record(oi.getBatch(), order.getCabinet(),

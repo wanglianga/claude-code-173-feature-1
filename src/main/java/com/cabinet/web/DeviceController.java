@@ -1,6 +1,7 @@
 package com.cabinet.web;
 
 import com.cabinet.config.KafkaConfig;
+import com.cabinet.domain.DeviceCommand;
 import com.cabinet.kafka.DeviceEventProcessor;
 import com.cabinet.kafka.dto.DeviceEvent;
 import io.swagger.v3.oas.annotations.Operation;
@@ -27,15 +28,18 @@ public class DeviceController {
     private final KafkaTemplate<String, DeviceEvent> kafkaTemplate;
     private final DeviceEventProcessor processor;
 
-    @Operation(summary = "上报单个设备事件（默认进 Kafka；sync=true 同步处理）")
+    @Operation(summary = "上报单个设备事件（默认进 Kafka；sync=true 同步处理）。"
+            + "COMMAND_PULL 同步模式会返回柜端需执行的停售/复售指令")
     @PostMapping("/events")
     @PreAuthorize("hasAnyRole('OPERATOR','ADMIN','REPLENISHER')")
     public Map<String, Object> publish(@RequestBody DeviceEvent event,
                                        @RequestParam(defaultValue = "false") boolean sync)
             throws Exception {
         if (sync) {
-            processor.process(event);
-            return Map.of("mode", "sync", "processed", 1);
+            List<DeviceCommand> commands = processor.process(event);
+            return commands.isEmpty()
+                    ? Map.of("mode", "sync", "processed", 1)
+                    : Map.of("mode", "sync", "processed", 1, "commands", commands);
         }
         String key = event.getCabinetNo() != null ? event.getCabinetNo() : event.getSessionNo();
         kafkaTemplate.send(KafkaConfig.TOPIC_DEVICE, key, event).get();

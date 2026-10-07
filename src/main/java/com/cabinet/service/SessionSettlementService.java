@@ -10,10 +10,14 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.LockModeType;
+
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * 开门会话与结算服务：
@@ -41,6 +45,13 @@ public class SessionSettlementService {
     private final RecognitionFusion fusion;
     private final AlertService alertService;
     private final BizEventPublisher bizEventPublisher;
+    private final EntityManager entityManager;
+
+    /** 加悲观写锁并立即刷新为库内最新值（拿到并发停售事务提交后的隔离量/停售标记） */
+    private ChannelStock lockStockFresh(ChannelStock s) {
+        entityManager.refresh(s, LockModeType.PESSIMISTIC_WRITE);
+        return s;
+    }
 
     @Value("${cabinet.recognition.confidence-threshold:0.75}")
     private double confidenceThreshold;
@@ -209,34 +220,49 @@ public class SessionSettlementService {
 
     /** 真正扣库存 + 生成订单明细 + 台账 */
     private OrderRecord doSettle(DoorSession session, List<RecognitionFusion.NetLine> lines) {
+        // 全局锁序 cabinet -> batch -> stock：先锁柜机（与温控隔离、临期扫描、清点一致）
+        entityManager.find(Cabinet.class, session.getCabinet().getId(),
+                LockModeType.PESSIMISTIC_WRITE);
+
         List<Deduction> deductions = new ArrayList<>();
+        // 记录扣款时批次已被临期停售的情况（开门/停售并发），供客服主动风险跟进
+        Set<Long> soldBlockedBatchIds = new LinkedHashSet<>();
         for (RecognitionFusion.NetLine line : lines) {
             Channel channel = channelRepository
                     .findByCabinetIdAndCode(session.getCabinet().getId(), line.channelCode())
                     .orElseThrow(() -> ApiException.conflict("货道不存在: " + line.channelCode()));
-            int remain = line.qty();
-            // RFID 批次提示优先，其余按 FEFO
-            List<ChannelStock> fefo = stockRepository.findSellableByChannelFefo(channel.getId());
+
+            // 统一全局加锁顺序：先批次(按id)，再货道批次库存行(到期日->id)，
+            // 与临期扫描、清点(批次->库存)一致，杜绝 AB-BA 死锁（订单明细外键也会锁批次）。
+            List<ChannelStock> rows0 = stockRepository.findAllByChannelFefo(channel.getId());
+            rows0.stream().map(ChannelStock::getBatch).distinct()
+                    .sorted(Comparator.comparing(ProductBatch::getId))
+                    .forEach(b -> entityManager.refresh(b, LockModeType.PESSIMISTIC_WRITE));
+            List<ChannelStock> allRows = rows0.stream()
+                    .sorted(Comparator.comparing((ChannelStock s) -> s.getBatch().getExpiryDate())
+                            .thenComparing(s -> s.getBatch().getId()))
+                    .map(this::lockStockFresh)
+                    .collect(Collectors.toCollection(ArrayList::new));
+            // RFID 批次提示优先
             if (line.batchHint() != null) {
-                ChannelStock hinted = fefo.stream()
-                        .filter(s -> s.getBatch().getId().equals(line.batchHint().getId()))
-                        .findFirst().orElse(null);
-                if (hinted != null) {
-                    fefo = new ArrayList<>();
-                    fefo.add(hinted);
-                    fefo.addAll(stockRepository.findSellableByChannelFefo(channel.getId()).stream()
-                            .filter(s -> !s.getBatch().getId().equals(line.batchHint().getId())).toList());
-                }
+                allRows.sort(Comparator.comparing(
+                        s -> !s.getBatch().getId().equals(line.batchHint().getId())));
             }
-            for (ChannelStock stock : fefo) {
-                if (remain <= 0) break;
-                int sellable = stock.getQtyOnHand() - stock.getQtyQuarantined();
-                int take = Math.min(remain, sellable);
-                if (take <= 0) continue;
-                stock.setQtyOnHand(stock.getQtyOnHand() - take);
-                stockRepository.save(stock);
-                deductions.add(new Deduction(channel.getCode(), line.product(), stock.getBatch(), take));
-                remain -= take;
+            // 先扣正常可售批次，再在可售不足时从已停售批次兜底（开门先于停售的并发场景）
+            List<ChannelStock> normal = allRows.stream()
+                    .filter(s -> !s.getBatch().isSaleBlocked()
+                            && s.getQtyOnHand() - s.getQtyQuarantined() > 0)
+                    .toList();
+            List<ChannelStock> blockedFallback = allRows.stream()
+                    .filter(s -> s.getBatch().isSaleBlocked() && s.getQtyOnHand() > 0)
+                    .toList();
+
+            int remain = line.qty();
+            remain = deductRows(channel.getCode(), line.product(), remain, normal,
+                    deductions, soldBlockedBatchIds, false);
+            if (remain > 0) {
+                remain = deductRows(channel.getCode(), line.product(), remain, blockedFallback,
+                        deductions, soldBlockedBatchIds, true);
             }
             if (remain > 0) {
                 throw ApiException.conflict("货道 " + line.channelCode()
@@ -283,9 +309,21 @@ public class SessionSettlementService {
 
             BigDecimal cost = d.batch.getCostPrice() != null
                     ? d.batch.getCostPrice().multiply(BigDecimal.valueOf(d.qty)) : BigDecimal.ZERO;
+            String note = "会话 " + session.getSessionNo() + " 售出 " + d.channelCode;
+            if (soldBlockedBatchIds.contains(d.batch.getId())) {
+                note += "（批次停售与开门并发，停售兜底售出）";
+            }
             ledgerService.record(d.batch, session.getCabinet(), LedgerType.SALE_OUT, -d.qty,
-                    cost, "ORDER", order.getId(),
-                    "会话 " + session.getSessionNo() + " 售出 " + d.channelCode);
+                    cost, "ORDER", order.getId(), note);
+
+            // 商品在临期停售后仍被买走（开门/停售/扣款并发）：生成风险提醒，客服按批次主动跟进
+            if (soldBlockedBatchIds.contains(d.batch.getId())) {
+                alertService.raise(session.getCabinet(), AlertType.SOLD_EXPIRED, "CRITICAL",
+                        "批次 " + d.batch.getBatchNo() + " 已停售但在停售并发窗口被买走 "
+                                + d.qty + " 件，订单 " + order.getOrderNo()
+                                + "，客服需按批次联系用户处理退款/风险提示",
+                        "ORDER", order.getId());
+            }
         }
         order.setTotalAmount(total);
         order.setNote("融合识别源: " + lines.stream()
@@ -311,11 +349,11 @@ public class SessionSettlementService {
             Channel channel = channelRepository
                     .findByCabinetIdAndCode(cabinet.getId(), line.channelCode()).orElse(null);
             if (channel == null) { errors.add("货道不存在 " + line.channelCode()); continue; }
-            int sellable = stockRepository.findSellableByChannelFefo(channel.getId()).stream()
-                    .mapToInt(s -> s.getQtyOnHand() - s.getQtyQuarantined()).sum();
-            if (sellable < line.qty()) {
+            // 用数据库已提交值聚合（含停售批次兜底量），避免读到并发停售前加载的陈旧批次
+            int available = stockRepository.sumAvailableForSettle(channel.getId());
+            if (available < line.qty()) {
                 errors.add(String.format("货道 %s 识别拿走 %d 件但可售库存仅 %d 件",
-                        line.channelCode(), line.qty(), sellable));
+                        line.channelCode(), line.qty(), available));
             }
         }
         return errors;
@@ -343,6 +381,32 @@ public class SessionSettlementService {
     private String genNo(String prefix) {
         return prefix + LocalDate.now().toString().replace("-", "")
                 + String.format("%04d", System.nanoTime() % 10000);
+    }
+
+    /**
+     * 从一批候选库存行按 FEFO 顺序扣减。
+     * blocked=true 表示这些是已停售批次（开门先于停售的兜底扣款），
+     * 其数量全部处于隔离态，扣减时同步核减隔离量。
+     */
+    private int deductRows(String channelCode, Product product, int remain,
+                           List<ChannelStock> rows, List<Deduction> deductions,
+                           Set<Long> soldBlockedBatchIds, boolean blocked) {
+        for (ChannelStock stock : rows) {
+            if (remain <= 0) break;
+            int available = blocked ? stock.getQtyOnHand()
+                    : stock.getQtyOnHand() - stock.getQtyQuarantined();
+            int take = Math.min(remain, available);
+            if (take <= 0) continue;
+            stock.setQtyOnHand(stock.getQtyOnHand() - take);
+            if (blocked) {
+                stock.setQtyQuarantined(Math.max(0, stock.getQtyQuarantined() - take));
+                soldBlockedBatchIds.add(stock.getBatch().getId());
+            }
+            stockRepository.save(stock);
+            deductions.add(new Deduction(channelCode, product, stock.getBatch(), take));
+            remain -= take;
+        }
+        return remain;
     }
 
     private record Deduction(String channelCode, Product product, ProductBatch batch, int qty) {}

@@ -57,8 +57,13 @@ cabinet:
   expiry:
     # 距到期 <= 该天数即视为临期
     near-expiry-days: 2
+  task:
+    # 临期下架任务生成后要求多少小时内到场处理（逾期判定）
+    near-expiry-due-hours: 8
   # 临期扫描 cron（每日 02:10）
   scan-cron: "0 10 2 * * *"
+  # 逾期任务巡检 cron（每小时整点）
+  overdue-cron: "0 0 * * * *"
 
 logging:
   level:

@@ -91,6 +91,11 @@ public class RestockService {
         if (batch.getExpiryDate() == null) {
             batch.setExpiryDate(expiryDate);
         }
+        // 限流曝光：下架任务逾期未处理的批次禁止再次上架/曝光，必须先由运营解除
+        if (batch.isExposureBlocked()) {
+            throw ApiException.badRequest("批次 " + batchNo
+                    + " 因下架任务逾期已被限制曝光，禁止再次上架，请先处置该批次任务");
+        }
         batch.setReceivedQty(batch.getReceivedQty() + qty);
         if (batch.getStatus() != BatchStatus.IN_STOCK) {
             batch.setStatus(BatchStatus.IN_STOCK);

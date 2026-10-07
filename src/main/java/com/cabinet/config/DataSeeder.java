@@ -27,6 +27,7 @@ public class DataSeeder implements CommandLineRunner {
     private final CabinetRepository cabinetRepository;
     private final ChannelRepository channelRepository;
     private final ProductBatchRepository batchRepository;
+    private final ChannelStockRepository channelStockRepository;
     private final PasswordEncoder passwordEncoder;
 
     @Override
@@ -94,22 +95,54 @@ public class DataSeeder implements CommandLineRunner {
                 .tempMin(0.0).tempMax(8.0).lastTempC(5.0)
                 .status(CabinetStatus.NORMAL).build());
 
-        channelRepository.save(Channel.builder().cabinet(c1).code("A01")
+        Channel c1a01 = channelRepository.save(Channel.builder().cabinet(c1).code("A01")
                 .plannedProduct(sandwich).capacity(12).build());
-        channelRepository.save(Channel.builder().cabinet(c1).code("A02")
+        Channel c1a02 = channelRepository.save(Channel.builder().cabinet(c1).code("A02")
                 .plannedProduct(milk).capacity(20).build());
-        channelRepository.save(Channel.builder().cabinet(c2).code("A01")
+        Channel c2a01 = channelRepository.save(Channel.builder().cabinet(c2).code("A01")
                 .plannedProduct(water).capacity(30).build());
-        channelRepository.save(Channel.builder().cabinet(c3).code("A01")
+        Channel c3a01 = channelRepository.save(Channel.builder().cabinet(c3).code("A01")
                 .plannedProduct(milk).capacity(20).build());
 
-        // 一个即将临期的批次（供定时扫描演示）
-        batchRepository.save(ProductBatch.builder()
+        // 一个即将临期的批次（供定时扫描演示）：已在 CAB-003/A01 上架 6 盒，扫描即停售并生成任务
+        ProductBatch seedBatch = batchRepository.save(ProductBatch.builder()
                 .batchNo("B-MILK-SEED").product(milk).supplier(fresh)
                 .productionDate(LocalDate.now().minusDays(6))
                 .expiryDate(LocalDate.now().plusDays(1))
-                .receivedQty(0).costPrice(milk.getCostPrice())
+                .receivedQty(6).costPrice(milk.getCostPrice())
                 .status(BatchStatus.IN_STOCK).build());
+        channelStockRepository.save(ChannelStock.builder()
+                .channel(c3a01).batch(seedBatch).product(milk)
+                .qtyOnHand(6).qtyQuarantined(0).build());
+
+        // 常规在库：CAB-001 三明治 5 份、牛奶 8 盒；CAB-002 水 10 瓶
+        ProductBatch bSandwich = batchRepository.save(ProductBatch.builder()
+                .batchNo("B-SANDWICH-SEED").product(sandwich).supplier(fresh)
+                .productionDate(LocalDate.now().minusDays(1))
+                .expiryDate(LocalDate.now().plusDays(2))
+                .receivedQty(5).costPrice(sandwich.getCostPrice())
+                .status(BatchStatus.IN_STOCK).build());
+        channelStockRepository.save(ChannelStock.builder()
+                .channel(c1a01).batch(bSandwich).product(sandwich)
+                .qtyOnHand(5).qtyQuarantined(0).build());
+        ProductBatch bMilk = batchRepository.save(ProductBatch.builder()
+                .batchNo("B-MILK-FRESH").product(milk).supplier(fresh)
+                .productionDate(LocalDate.now().minusDays(1))
+                .expiryDate(LocalDate.now().plusDays(6))
+                .receivedQty(8).costPrice(milk.getCostPrice())
+                .status(BatchStatus.IN_STOCK).build());
+        channelStockRepository.save(ChannelStock.builder()
+                .channel(c1a02).batch(bMilk).product(milk)
+                .qtyOnHand(8).qtyQuarantined(0).build());
+        ProductBatch bWater = batchRepository.save(ProductBatch.builder()
+                .batchNo("B-WATER-SEED").product(water).supplier(drink)
+                .productionDate(LocalDate.now().minusDays(30))
+                .expiryDate(LocalDate.now().plusDays(300))
+                .receivedQty(10).costPrice(water.getCostPrice())
+                .status(BatchStatus.IN_STOCK).build());
+        channelStockRepository.save(ChannelStock.builder()
+                .channel(c2a01).batch(bWater).product(water)
+                .qtyOnHand(10).qtyQuarantined(0).build());
 
         log.info("种子数据初始化完成，测试账号统一密码 cabinet123");
     }
