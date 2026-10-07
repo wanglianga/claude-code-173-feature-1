@@ -83,11 +83,12 @@ public class ComplaintService {
      * 判责处理：退款。
      * refundItems: orderItemId -> 退款数量（为空且 grantRefund=true 则整单退）
      * goodsReturned: 商品是否已收回；未收回 -> 报损（退款未收回）
+     * supplierLiability: 责任归属供应商（临期/质量问题）时报损计 SUPPLIER，结算从应付扣除
      */
     @Transactional
     public Complaint resolve(String complaintNo, String handlerUsername, boolean grantRefund,
                              List<RefundLine> refundItems, boolean goodsReturned,
-                             String resolution) {
+                             boolean supplierLiability, String resolution) {
         Complaint complaint = complaintRepository.findByComplaintNo(complaintNo)
                 .orElseThrow(() -> ApiException.notFound("投诉单不存在"));
         AppUser handler = userRepository.findByUsername(handlerUsername)
@@ -134,6 +135,10 @@ public class ComplaintService {
                             .orElse(null);
                     if (stock != null) {
                         stock.setQtyOnHand(stock.getQtyOnHand() + refundQty);
+                        // 批次已停售/限制曝光时收回品同样不得再售
+                        if (oi.getBatch().isSaleHalted() || oi.getBatch().isExposureBlocked()) {
+                            stock.setQtySaleHalted(stock.getQtySaleHalted() + refundQty);
+                        }
                         stockRepository.save(stock);
                     }
                     ledgerService.record(oi.getBatch(), order.getCabinet(),
@@ -150,13 +155,15 @@ public class ComplaintService {
                             .product(oi.getProduct()).batch(oi.getBatch())
                             .reason(LossReason.REFUND_NO_RETURN)
                             .qty(refundQty).costAmount(cost)
-                            .liability("OPERATOR")
+                            .liability(supplierLiability ? "SUPPLIER" : "OPERATOR")
                             .bizType("COMPLAINT").bizId(complaint.getId())
-                            .remark("误判退款，商品未收回").build());
+                            .remark(supplierLiability ? "供应商责任退款（临期/质量），商品未收回"
+                                    : "误判退款，商品未收回").build());
                     ledgerService.record(oi.getBatch(), order.getCabinet(),
                             LedgerType.LOSS_OUT, -refundQty, cost,
                             "COMPLAINT", complaint.getId(),
-                            "投诉退款商品未收回 " + complaintNo);
+                            (supplierLiability ? "供应商责任" : "")
+                                    + "投诉退款商品未收回 " + complaintNo);
                 }
             }
 

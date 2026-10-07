@@ -82,9 +82,10 @@ public class TemperatureService {
         List<ChannelStock> stocks = stockRepository.findByCabinetId(cabinet.getId());
         int n = 0;
         for (ChannelStock s : stocks) {
-            int sellable = s.getQtyOnHand() - s.getQtyQuarantined();
+            int sellable = s.sellableQty();
             if (sellable > 0) {
-                s.setQtyQuarantined(s.getQtyOnHand());
+                // 仅隔离当前仍可售部分，已临期停售量不重复隔离
+                s.setQtyQuarantined(s.getQtyQuarantined() + sellable);
                 stockRepository.save(s);
                 n += sellable;
             }

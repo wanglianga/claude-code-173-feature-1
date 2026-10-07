@@ -12,7 +12,6 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
-
 /** 种子数据：测试账号、供应商、商品、点位、柜机货道与一个临期批次 */
 @Slf4j
 @Component
@@ -27,6 +26,8 @@ public class DataSeeder implements CommandLineRunner {
     private final CabinetRepository cabinetRepository;
     private final ChannelRepository channelRepository;
     private final ProductBatchRepository batchRepository;
+    private final ChannelStockRepository channelStockRepository;
+    private final BatchLedgerRepository batchLedgerRepository;
     private final PasswordEncoder passwordEncoder;
 
     @Override
@@ -103,13 +104,26 @@ public class DataSeeder implements CommandLineRunner {
         channelRepository.save(Channel.builder().cabinet(c3).code("A01")
                 .plannedProduct(milk).capacity(20).build());
 
-        // 一个即将临期的批次（供定时扫描演示）
-        batchRepository.save(ProductBatch.builder()
+        // 一个即将临期的批次（供定时扫描演示）：CAB-001 A02 在柜 4 瓶
+        ProductBatch seedBatch = batchRepository.save(ProductBatch.builder()
                 .batchNo("B-MILK-SEED").product(milk).supplier(fresh)
                 .productionDate(LocalDate.now().minusDays(6))
                 .expiryDate(LocalDate.now().plusDays(1))
-                .receivedQty(0).costPrice(milk.getCostPrice())
+                .receivedQty(4).costPrice(milk.getCostPrice())
                 .status(BatchStatus.IN_STOCK).build());
+        Channel a02 = channelRepository.findAll().stream()
+                .filter(ch -> ch.getCabinet().getCabinetNo().equals("CAB-001")
+                        && ch.getCode().equals("A02"))
+                .findFirst().orElseThrow();
+        channelStockRepository.save(ChannelStock.builder()
+                .channel(a02).batch(seedBatch).product(milk)
+                .qtyOnHand(4).qtyQuarantined(0).qtySaleHalted(0).build());
+        batchLedgerRepository.save(BatchLedger.builder()
+                .batch(seedBatch).cabinet(c1)
+                .ledgerType(LedgerType.RESTOCK_IN)
+                .changeQty(4).balanceQty(4)
+                .amount(milk.getCostPrice().multiply(BigDecimal.valueOf(4)))
+                .bizType("SEED").bizId(0L).remark("种子临期批次上架 A02 x4").build());
 
         log.info("种子数据初始化完成，测试账号统一密码 cabinet123");
     }

@@ -111,6 +111,7 @@ public class StocktakeService {
                 int delta = target - stock.getQtyOnHand();
                 stock.setQtyOnHand(Math.max(0, target));
                 stock.setQtyQuarantined(Math.min(stock.getQtyQuarantined(), stock.getQtyOnHand()));
+                stock.setQtySaleHalted(Math.min(stock.getQtySaleHalted(), stock.getQtyOnHand()));
                 stockRepository.save(stock);
                 item.setAdjusted(true);
 

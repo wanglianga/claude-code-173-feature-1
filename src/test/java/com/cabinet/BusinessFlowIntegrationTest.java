@@ -270,7 +270,7 @@ class BusinessFlowIntegrationTest {
         assertThat(evidence.tempLogs()).isNotNull();
 
         Complaint resolved = complaintService.resolve(complaint.getComplaintNo(),
-                cs.getUsername(), true, null, false, "视频显示已放回，整单退款");
+                cs.getUsername(), true, null, false, false, "视频显示已放回，整单退款");
         assertThat(resolved.getStatus()).isEqualTo(ComplaintStatus.RESOLVED_REFUNDED);
         assertThat(resolved.getRefundAmount()).isEqualByComparingTo("5.50");
 
@@ -298,7 +298,7 @@ class BusinessFlowIntegrationTest {
         AppUser cs = fx.user("CUSTOMER_SERVICE");
         Complaint c = complaintService.submit(sessionNo, "临期变质", "牛奶变味");
         complaintService.resolve(c.getComplaintNo(), cs.getUsername(),
-                true, null, true, "商品收回，退款并报损由下架流程处理");
+                true, null, true, false, "商品收回，退款并报损由下架流程处理");
         assertThat(stockRepository.findByChannelId(d.channel.getId()).get(0).getQtyOnHand())
                 .isEqualTo(5);
         assertThat(ledgerRepository.findByBatchIdOrderByIdAsc(d.batch.getId()))

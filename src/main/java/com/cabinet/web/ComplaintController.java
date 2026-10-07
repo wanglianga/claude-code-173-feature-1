@@ -27,6 +27,7 @@ public class ComplaintController {
     public record ResolveRequest(Boolean grantRefund,
                                  List<ComplaintService.RefundLine> refundItems,
                                  Boolean goodsReturned,
+                                 Boolean supplierLiability,
                                  String resolution) {}
 
     @Operation(summary = "用户就某开门会话提交投诉（误扣款/放回仍计费/临期变质/卡货等）")
@@ -57,7 +58,8 @@ public class ComplaintController {
                              Principal principal) {
         boolean grant = Boolean.TRUE.equals(req.grantRefund());
         boolean returned = Boolean.TRUE.equals(req.goodsReturned());
+        boolean supplierLiable = Boolean.TRUE.equals(req.supplierLiability());
         return complaintService.resolve(complaintNo, principal.getName(), grant,
-                req.refundItems(), returned, req.resolution());
+                req.refundItems(), returned, supplierLiable, req.resolution());
     }
 }

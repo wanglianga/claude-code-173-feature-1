@@ -210,38 +210,71 @@ public class SessionSettlementService {
     /** 真正扣库存 + 生成订单明细 + 台账 */
     private OrderRecord doSettle(DoorSession session, List<RecognitionFusion.NetLine> lines) {
         List<Deduction> deductions = new ArrayList<>();
+        List<ProductBatch> inFlightHaltedBatches = new ArrayList<>();
         for (RecognitionFusion.NetLine line : lines) {
             Channel channel = channelRepository
                     .findByCabinetIdAndCode(session.getCabinet().getId(), line.channelCode())
                     .orElseThrow(() -> ApiException.conflict("货道不存在: " + line.channelCode()));
             int remain = line.qty();
-            // RFID 批次提示优先，其余按 FEFO
+            // RFID 批次提示优先，其余按 FEFO；仅从未停售/未限制曝光批次扣减
             List<ChannelStock> fefo = stockRepository.findSellableByChannelFefo(channel.getId());
             if (line.batchHint() != null) {
                 ChannelStock hinted = fefo.stream()
                         .filter(s -> s.getBatch().getId().equals(line.batchHint().getId()))
                         .findFirst().orElse(null);
                 if (hinted != null) {
-                    fefo = new ArrayList<>();
-                    fefo.add(hinted);
-                    fefo.addAll(stockRepository.findSellableByChannelFefo(channel.getId()).stream()
-                            .filter(s -> !s.getBatch().getId().equals(line.batchHint().getId())).toList());
+                    List<ChannelStock> reordered = new ArrayList<>();
+                    reordered.add(hinted);
+                    fefo.stream().filter(s -> !s.getBatch().getId().equals(line.batchHint().getId()))
+                            .forEach(reordered::add);
+                    fefo = reordered;
                 }
             }
+            // 第一遍：锁定库存行后扣正常可售量
             for (ChannelStock stock : fefo) {
                 if (remain <= 0) break;
-                int sellable = stock.getQtyOnHand() - stock.getQtyQuarantined();
+                ChannelStock locked = stockRepository.lockById(stock.getId()).orElse(stock);
+                int sellable = locked.sellableQty();
                 int take = Math.min(remain, sellable);
                 if (take <= 0) continue;
-                stock.setQtyOnHand(stock.getQtyOnHand() - take);
-                stockRepository.save(stock);
-                deductions.add(new Deduction(channel.getCode(), line.product(), stock.getBatch(), take));
+                locked.setQtyOnHand(locked.getQtyOnHand() - take);
+                stockRepository.save(locked);
+                deductions.add(new Deduction(channel.getCode(), line.product(), locked.getBatch(), take));
                 remain -= take;
+            }
+            // 第二遍：开门在途期间批次刚被临期停售（柜机尚未摘品/用户物理已拿），
+            // 从停售量中扣减，订单与下架账通过后续清点差异自动对齐
+            if (remain > 0) {
+                for (ChannelStock stock : stockRepository.findAllByChannelFefo(channel.getId())) {
+                    if (remain <= 0) break;
+                    ChannelStock locked = stockRepository.lockById(stock.getId()).orElse(stock);
+                    int inFlight = Math.min(remain, locked.getQtySaleHalted());
+                    if (inFlight <= 0) continue;
+                    locked.setQtyOnHand(locked.getQtyOnHand() - inFlight);
+                    locked.setQtySaleHalted(locked.getQtySaleHalted() - inFlight);
+                    stockRepository.save(locked);
+                    deductions.add(new Deduction(channel.getCode(), line.product(),
+                            locked.getBatch(), inFlight));
+                    inFlightHaltedBatches.add(locked.getBatch());
+                    remain -= inFlight;
+                }
             }
             if (remain > 0) {
                 throw ApiException.conflict("货道 " + line.channelCode()
                         + " 可售库存不足，缺少 " + remain + " 件 " + line.product().getSku());
             }
+        }
+        // 停售量因在途售出归零的批次，若全柜无其他停售量则解除停售标记（曝光限制须运营解封）
+        for (ProductBatch b : inFlightHaltedBatches.stream().distinct().toList()) {
+            if (stockRepository.sumSaleHaltedByBatch(b.getId()) <= 0 && !b.isExposureBlocked()) {
+                b.setSaleHalted(false);
+                b.setHaltReason(null);
+                batchRepository.save(b);
+            }
+            alertService.raise(session.getCabinet(), AlertType.BATCH_RISK, "WARN",
+                    "开门会话 " + session.getSessionNo() + " 在途售出已停售批次 "
+                            + b.getBatchNo() + "，需关注临期售出风险与供应商责任",
+                    "BATCH", b.getId());
         }
 
         // 聚合同批次/同货道扣减为订单明细并记账
@@ -311,11 +344,12 @@ public class SessionSettlementService {
             Channel channel = channelRepository
                     .findByCabinetIdAndCode(cabinet.getId(), line.channelCode()).orElse(null);
             if (channel == null) { errors.add("货道不存在 " + line.channelCode()); continue; }
-            int sellable = stockRepository.findSellableByChannelFefo(channel.getId()).stream()
+            // 可售量 + 临期停售量都可结算（开门在途停售按风险单处理），温控隔离量不可售
+            int available = stockRepository.findAllByChannelFefo(channel.getId()).stream()
                     .mapToInt(s -> s.getQtyOnHand() - s.getQtyQuarantined()).sum();
-            if (sellable < line.qty()) {
-                errors.add(String.format("货道 %s 识别拿走 %d 件但可售库存仅 %d 件",
-                        line.channelCode(), line.qty(), sellable));
+            if (available < line.qty()) {
+                errors.add(String.format("货道 %s 识别拿走 %d 件但可用库存仅 %d 件",
+                        line.channelCode(), line.qty(), available));
             }
         }
         return errors;
